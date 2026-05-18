@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebRTC 2-Player Boilerplate</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 2rem auto; padding: 1rem; }
+    h1 { margin-top: 0; }
+    code { background: #eee; padding: 0.1rem 0.3rem; border-radius: 3px; }
+    #qr { margin: 1rem 0; image-rendering: pixelated; }
+    #log { background: #f4f4f4; padding: 0.75rem; min-height: 120px; max-height: 240px;
+           overflow-y: auto; white-space: pre-wrap; font-family: ui-monospace, monospace;
+           font-size: 0.85rem; border-radius: 4px; }
+    input, button { padding: 0.5rem; font-size: 1rem; }
+    input { width: 60%; }
+    .status { padding: 0.5rem 0.75rem; border-radius: 4px; margin: 0.5rem 0; }
+    .waiting   { background: #fff3cd; }
+    .connected { background: #d4edda; }
+    .share-link { word-break: break-all; }
+  </style>
+</head>
+<body>
+  <h1>WebRTC 2-Player Demo</h1>
+
+  <div id="status" class="status waiting">Connecting…</div>
+
+  <p>Room: <code id="room-name"></code></p>
+  <p>Share this link or QR code:</p>
+  <canvas id="qr"></canvas>
+  <p><a id="share-link" class="share-link" href=""></a></p>
+
+  <h2>P2P Chat</h2>
+  <p>Once connected, messages travel directly browser-to-browser.</p>
+  <div>
+    <input id="msg" type="text" placeholder="Type a message" autocomplete="off" />
+    <button id="send">Send</button>
+  </div>
+  <div id="log" aria-live="polite"></div>
+
+  <script type="module">
+    import { joinRoom } from 'https://esm.sh/trystero@0.24.0'
+    import QRCode      from 'https://esm.sh/qrcode@1.5.4'
+
+    // ── Room ID: read from URL, or generate one and rewrite the URL ──────────
+    const params = new URLSearchParams(location.search)
+    let roomId = params.get('room')
+    if (!roomId) {
+      roomId = Math.random().toString(36).slice(2, 8)            // e.g. "k3f9z2"
+      history.replaceState(null, '', `${location.pathname}?room=${roomId}`)
+    }
+
+    const shareUrl = `${location.origin}${location.pathname}?room=${roomId}`
+    document.getElementById('room-name').textContent = roomId
+
+    const link = document.getElementById('share-link')
+    link.href = shareUrl
+    link.textContent = shareUrl
+
+    QRCode.toCanvas(document.getElementById('qr'), shareUrl, { width: 220 })
+
+    // ── WebRTC via Trystero (signaling over public Nostr relays) ─────────────
+    // `appId` namespaces your rooms — change it to anything unique to your game
+    // so you don't collide with other apps using the same room name.
+    const room = joinRoom({
+      appId: 'moretticb-game-v1',
+      relayConfig: {
+        urls: [
+          'wss://relay.damus.io',
+          'wss://nos.lol',
+          'wss://relay.nostr.band',
+          'wss://nostr.wine',
+        ],
+        redundancy: 3,
+      },
+    }, roomId)
+
+    // Named actions = typed channels. Returns [send, receive].
+    const [sendMessage, onMessage] = room.makeAction('msg')
+
+    const statusEl = document.getElementById('status')
+    const logEl    = document.getElementById('log')
+    const log = (line) => {
+      logEl.textContent += line + '\n'
+      logEl.scrollTop = logEl.scrollHeight
+    }
+
+    const setStatus = (text, cls) => {
+      statusEl.textContent = text
+      statusEl.className = `status ${cls}`
+    }
+    setStatus('Waiting for opponent…', 'waiting')
+
+    room.onPeerJoin(peerId => {
+      log(`✔ peer joined: ${peerId.slice(0, 8)}`)
+      setStatus(`Connected to ${peerId.slice(0, 8)}`, 'connected')
+    })
+
+    room.onPeerLeave(peerId => {
+      log(`✘ peer left:   ${peerId.slice(0, 8)}`)
+      setStatus('Waiting for opponent…', 'waiting')
+    })
+
+    onMessage((data, peerId) => {
+      log(`${peerId.slice(0, 8)}: ${data}`)
+    })
+
+    // ── UI ───────────────────────────────────────────────────────────────────
+    const msgInput = document.getElementById('msg')
+    const sendBtn  = document.getElementById('send')
+    const send = () => {
+      const text = msgInput.value.trim()
+      if (!text) return
+      sendMessage(text)
+      log(`me: ${text}`)
+      msgInput.value = ''
+    }
+    sendBtn.onclick = send
+    msgInput.addEventListener('keydown', e => { if (e.key === 'Enter') send() })
+  </script>
+</body>
+</html>
