@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>WebRTC Pong</title>
+  <title>Coin Hunt</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 1rem; }
     h1 { margin-top: 0; }
@@ -18,15 +18,15 @@
     .waiting   { background: #fff3cd; }
     .connected { background: #d4edda; }
     .share-link { word-break: break-all; }
-    .scoreline { text-align: center; font-size: 1.5rem; font-family: ui-monospace, monospace;
-                 margin: 0.25rem 0; letter-spacing: 0.2rem; }
-    .scoreline .host   { color: #0a0; }
-    .scoreline .client { color: #088; }
+    #scores { text-align: center; font-family: ui-monospace, monospace;
+              margin: 0.5rem 0; min-height: 1.2em; }
+    #scores .me::before   { content: '> '; }
+    #scores .host::after  { content: ' ♔'; }
     .hint { text-align: center; color: #666; font-size: 0.8rem; margin: 0.25rem 0 1rem; }
   </style>
 </head>
 <body>
-  <h1>WebRTC Pong</h1>
+  <h1>Coin Hunt</h1>
   <div id="status" class="status waiting">Connecting…</div>
 
   <p>Room: <code id="room-name"></code></p>
@@ -34,21 +34,19 @@
   <canvas id="qr"></canvas>
   <p><a id="share-link" class="share-link" href=""></a></p>
 
-  <div class="scoreline">
-    <span class="host"   id="score-host">0</span>
-    <span> — </span>
-    <span class="client" id="score-client">0</span>
-  </div>
+  <div id="scores"></div>
   <canvas id="field" width="600" height="400"></canvas>
-  <p class="hint">Arrow keys / W-S — or drag on the field (mobile)</p>
+  <p class="hint">Arrow keys / WASD — or drag on the field. Grab the yellow coins.</p>
 
   <div id="log" aria-live="polite"></div>
 
   <script type="module">
-    import { joinRoom, selfId } from 'https://esm.sh/trystero@0.24.0'
-    import QRCode               from 'https://esm.sh/qrcode@1.5.4'
+    import { joinRoom } from './room.js'
+    import QRCode       from 'https://esm.sh/qrcode@1.5.4'
 
-    // ── Rendezvous: take room ID from URL, or generate one and rewrite URL ───
+    // ════════════════════════════════════════════════════════════════════════
+    // RENDEZVOUS
+    // ════════════════════════════════════════════════════════════════════════
     const roomId = new URLSearchParams(location.search).get('room') || (() => {
       const id = Math.random().toString(36).slice(2, 8)
       history.replaceState(null, '', `${location.pathname}?room=${id}`)
@@ -56,173 +54,275 @@
     })()
     const shareUrl = `${location.origin}${location.pathname}?room=${roomId}`
     document.getElementById('room-name').textContent = roomId
-    const shareLink = document.getElementById('share-link')
-    shareLink.href = shareLink.textContent = shareUrl
+    const shareLinkEl = document.getElementById('share-link')
+    shareLinkEl.href = shareLinkEl.textContent = shareUrl
     QRCode.toCanvas(document.getElementById('qr'), shareUrl, { width: 220 })
 
-    // ── DOM refs + tiny helpers ──────────────────────────────────────────────
+    // ── DOM ──────────────────────────────────────────────────────────────────
     const statusEl    = document.getElementById('status')
     const logEl       = document.getElementById('log')
-    const hostScoreEl = document.getElementById('score-host')
-    const clientScoreEl = document.getElementById('score-client')
+    const scoresEl    = document.getElementById('scores')
     const fieldCanvas = document.getElementById('field')
-    const ctx = fieldCanvas.getContext('2d')
-
+    const ctx         = fieldCanvas.getContext('2d')
     const setStatus = (text, cls) => { statusEl.textContent = text; statusEl.className = `status ${cls}` }
-    const log = line => { logEl.textContent += line + '\n'; logEl.scrollTop = logEl.scrollHeight }
-    setStatus('Waiting for opponent…', 'waiting')
-
-    // ── Game state ───────────────────────────────────────────────────────────
-    const W = 600, H = 400, PADDLE_H = 80, PADDLE_W = 10, BALL_R = 8
-    const PADDLE_SPEED = 380, BALL_SPEED = 280
-
-    let myRole = null                                  // 'host' | 'client' | null
-    const otherRole = r => r === 'host' ? 'client' : 'host'
-
-    const state = {
-      paddles: { host: (H - PADDLE_H) / 2, client: (H - PADDLE_H) / 2 },
-      ball:    { x: W / 2, y: H / 2, vx: BALL_SPEED, vy: BALL_SPEED * 0.4 },
-      score:   { host: 0, client: 0 },
-    }
-    const renderScore = () => {
-      hostScoreEl.textContent   = state.score.host
-      clientScoreEl.textContent = state.score.client
-    }
+    const log       = line => { logEl.textContent += line + '\n'; logEl.scrollTop = logEl.scrollHeight }
 
     // ════════════════════════════════════════════════════════════════════════
-    // NETWORKING (the part to lift into your own game)
-    //
-    //   1. joinRoom()        — open the room
-    //   2. makeAction(name)  — define a typed channel, returns [send, on]
-    //   3. on*() handlers    — react to incoming messages
-    //   4. onPeerJoin        — elect roles deterministically via selfId compare
-    //   5. setInterval       — 30Hz send loop for state snapshots
-    //
-    // Host authority: one peer owns the simulation, broadcasts state. The
-    // other peer renders snapshots. Each peer ALSO runs its own paddle
-    // locally for zero-latency input; their paddle Y is mirrored to the
-    // other side at 30Hz.
+    // ROOM (transport + presence + host election; see room.js)
     // ════════════════════════════════════════════════════════════════════════
-    const room = joinRoom({
-      appId: 'moretticb-game-v1',
-      relayConfig: {
-        urls: ['wss://relay.damus.io', 'wss://nos.lol',
-               'wss://relay.nostr.band', 'wss://nostr.wine'],
-        redundancy: 3,
-      },
-    }, roomId)
+    const room = joinRoom({ roomId })
+    log(`me: ${room.selfId.slice(0, 8)}`)
 
-    const [sendPaddle, onPaddle] = room.makeAction('paddle')
-    const [sendBall,   onBall]   = room.makeAction('ball')
-    const [sendScore,  onScore]  = room.makeAction('score')
+    room.onConnect(open => setStatus(
+      open === 0 ? 'No relays connected…' : `Connected (${open}/${room.totalRelays} relays)`,
+      open === 0 ? 'waiting' : 'connected'
+    ))
+    room.onPeerJoin(id => { ensurePlayer(id); renderScores(); log(`+ ${id.slice(0,8)}`) })
+    room.onPeerLeave(id => { delete players[id];               renderScores(); log(`- ${id.slice(0,8)}`) })
+    const logHost = id => log(`host: ${id ? id.slice(0,8) : 'none'}${id === room.selfId ? ' (me)' : ''}`)
+    logHost(room.hostId)                                 // initial host (set during joinRoom)
+    room.onHostChange(id => { logHost(id); renderScores() })
 
-    onPaddle(y => { if (myRole) state.paddles[otherRole(myRole)] = y })
-    onBall  (b => { if (myRole === 'client') state.ball = b })
-    onScore (s => { state.score = s; renderScore() })
+    // ════════════════════════════════════════════════════════════════════════
+    // GAME — Coin Hunt
+    //
+    // Movement is player-authoritative: each peer sends `turn` events with
+    // their direction and the position they had at that instant. Everyone
+    // else extrapolates `pos + dir * (now - turnTime) * SPEED` between turns.
+    //
+    // Items are host-authoritative: host emits `spawn` events; players send
+    // `grab` intents on contact; host validates and emits canonical `got`.
+    // Host also periodically broadcasts a `snap` (full world state) so late
+    // joiners and any host successor can bootstrap.
+    // ════════════════════════════════════════════════════════════════════════
+    const W = 600, H = 400
+    const SPEED            = 180     // px/s
+    const PLAYER_R         = 14
+    const COIN_R           = 10
+    const COIN_INTERVAL    = 2500    // ms — host spawn cadence
+    const SNAPSHOT_EVERY   = 5000    // ms — host broadcast cadence
+    const MAX_COINS        = 8
+    const INTENT_COOLDOWN  = 700     // ms — per-coin throttle for grab intents
+    const VALIDATION_SLACK = 1.6     // multiplier on hitbox at host (absorbs latency)
+    const COLORS = ['#0f0','#0ff','#f0f','#ff0','#f80','#0af','#fa0','#a0f']
 
-    room.onPeerJoin(peerId => {
-      myRole = selfId < peerId ? 'host' : 'client'   // both peers agree
-      setStatus(`Connected — you are the ${myRole.toUpperCase()} paddle`, 'connected')
-      log(`peer ${peerId.slice(0, 8)} joined → I am ${myRole}`)
-      if (myRole === 'host') resetBall(Math.random() < 0.5 ? 1 : -1)
+    const players = Object.create(null)    // pubkey -> { color, dir, pos, lastTurnTime, score }
+    const coins   = Object.create(null)    // coinId -> { x, y }
+
+    const colorFor = id => {
+      let h = 0; for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0
+      return COLORS[Math.abs(h) % COLORS.length]
+    }
+    function ensurePlayer(id) {
+      if (players[id]) return players[id]
+      return players[id] = {
+        color:        colorFor(id),
+        dir:          { x: 0, y: 0 },
+        pos:          { x: 60 + Math.random() * (W - 120), y: 60 + Math.random() * (H - 120) },
+        lastTurnTime: Date.now(),
+        score:        0,
+      }
+    }
+    function positionAt(p, t) {
+      const dt = Math.max(0, (t - p.lastTurnTime) / 1000)
+      const x  = ((p.pos.x + p.dir.x * SPEED * dt) % W + W) % W
+      const y  = ((p.pos.y + p.dir.y * SPEED * dt) % H + H) % H
+      return { x, y }
+    }
+    const torusDist2 = (a, b) => {
+      const dx = Math.min(Math.abs(a.x - b.x), W - Math.abs(a.x - b.x))
+      const dy = Math.min(Math.abs(a.y - b.y), H - Math.abs(a.y - b.y))
+      return dx * dx + dy * dy
+    }
+
+    ensurePlayer(room.selfId)
+
+    // ── Message handlers ─────────────────────────────────────────────────────
+    room.on('turn', ({ dir, pos, t }, from) => {
+      if (from === room.selfId) return                 // already applied locally
+      const p = ensurePlayer(from)
+      p.dir = dir; p.pos = pos; p.lastTurnTime = t
     })
 
-    room.onPeerLeave(peerId => {
-      log(`peer ${peerId.slice(0, 8)} left`)
-      myRole = null
-      setStatus('Waiting for opponent…', 'waiting')
+    room.on('spawn', ({ id, x, y }, from) => {
+      if (from !== room.hostId) return
+      coins[id] = { x, y }
     })
 
-    setInterval(() => { if (myRole)            sendPaddle(state.paddles[myRole]) }, 33)
-    setInterval(() => { if (myRole === 'host') sendBall(state.ball)              }, 33)
+    room.on('grab', async ({ coinId, t }, from) => {
+      if (!room.isHost) return
+      const coin = coins[coinId]
+      if (!coin) return                                // first valid claim wins
+      const p = players[from]
+      if (!p) return
+      const reach = (PLAYER_R + COIN_R) * VALIDATION_SLACK
+      if (torusDist2(positionAt(p, t), coin) > reach * reach) return
+      delete coins[coinId]                             // reserve so concurrent claims fail
+      await room.send('got', { coinId, by: from })
+      // State changes (score, render) happen uniformly in the 'got' handler
+      // below — including for us when the event echoes back through a relay.
+    })
 
-    // ── Input ────────────────────────────────────────────────────────────────
-    const input = { up: false, down: false, touchY: null }
-    const KEYS = { up: ['ArrowUp', 'w', 'W'], down: ['ArrowDown', 's', 'S'] }
+    room.on('got', ({ coinId, by }, from) => {
+      if (from !== room.hostId) return
+      delete coins[coinId]                             // no-op on host (already deleted in grab)
+      const p = players[by]
+      if (p) { p.score++; renderScores() }
+    })
 
+    room.on('snap', ({ players: ps, coins: cs }, from) => {
+      if (from !== room.hostId) return
+      for (const [id, info] of Object.entries(ps)) {
+        const p = ensurePlayer(id)
+        p.score = info.score | 0
+        // Only override movement if host's view is fresher than ours
+        if (id !== room.selfId && (info.lastTurnTime | 0) >= p.lastTurnTime) {
+          p.dir = info.dir; p.pos = info.pos; p.lastTurnTime = info.lastTurnTime
+        }
+      }
+      for (const id of Object.keys(coins)) if (!cs[id]) delete coins[id]
+      for (const [id, c] of Object.entries(cs)) coins[id] = c
+      renderScores()
+    })
+
+    // ── Host loops (fire on whichever peer is currently host) ────────────────
+    let coinSeq = 0
+    setInterval(() => {
+      if (!room.isHost) return
+      if (Object.keys(coins).length >= MAX_COINS) return
+      const id = `${Date.now().toString(36)}${(++coinSeq).toString(36)}`
+      const x  = 30 + Math.random() * (W - 60)
+      const y  = 30 + Math.random() * (H - 60)
+      coins[id] = { x, y }
+      room.send('spawn', { id, x, y })
+    }, COIN_INTERVAL)
+
+    setInterval(() => {
+      if (!room.isHost) return
+      const ps = {}
+      for (const [id, p] of Object.entries(players)) {
+        ps[id] = { score: p.score | 0, dir: p.dir, pos: p.pos, lastTurnTime: p.lastTurnTime }
+      }
+      room.send('snap', { players: ps, coins })
+    }, SNAPSHOT_EVERY)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // INPUT
+    // ════════════════════════════════════════════════════════════════════════
+    const KEYMAP = {
+      ArrowUp: 'up', w: 'up', W: 'up',  ArrowDown: 'down', s: 'down', S: 'down',
+      ArrowLeft: 'left', a: 'left', A: 'left',
+      ArrowRight: 'right', d: 'right', D: 'right',
+    }
+    const held = new Set()
+    const dirFromKeys = () => {
+      let x = 0, y = 0
+      if (held.has('left'))  x -= 1
+      if (held.has('right')) x += 1
+      if (held.has('up'))    y -= 1
+      if (held.has('down'))  y += 1
+      if (x === 0 && y === 0) return { x: 0, y: 0 }
+      const m = Math.hypot(x, y)
+      return { x: x / m, y: y / m }
+    }
     addEventListener('keydown', e => {
-      if (KEYS.up  .includes(e.key)) { input.up   = true; e.preventDefault() }
-      if (KEYS.down.includes(e.key)) { input.down = true; e.preventDefault() }
+      const k = KEYMAP[e.key]; if (!k) return
+      if (!held.has(k)) { held.add(k); commitTurn(dirFromKeys()) }
+      e.preventDefault()
     })
     addEventListener('keyup', e => {
-      if (KEYS.up  .includes(e.key)) input.up   = false
-      if (KEYS.down.includes(e.key)) input.down = false
+      const k = KEYMAP[e.key]; if (!k) return
+      held.delete(k); commitTurn(dirFromKeys()); e.preventDefault()
     })
 
+    let touchTarget = null
     const onTouch = e => {
       const r = fieldCanvas.getBoundingClientRect()
-      input.touchY = (e.touches[0].clientY - r.top) * (H / r.height)
+      touchTarget = {
+        x: (e.touches[0].clientX - r.left) * (W / r.width),
+        y: (e.touches[0].clientY - r.top)  * (H / r.height),
+      }
       e.preventDefault()
     }
     fieldCanvas.addEventListener('touchstart', onTouch, { passive: false })
     fieldCanvas.addEventListener('touchmove',  onTouch, { passive: false })
-    fieldCanvas.addEventListener('touchend',   () => input.touchY = null)
+    fieldCanvas.addEventListener('touchend',   () => { touchTarget = null; commitTurn({ x: 0, y: 0 }) })
 
-    // ── Simulation ───────────────────────────────────────────────────────────
-    const resetBall = dir => Object.assign(state.ball, {
-      x: W / 2, y: H / 2,
-      vx: BALL_SPEED * dir,
-      vy: BALL_SPEED * (Math.random() * 0.6 - 0.3),
-    })
-
-    const bouncePaddle = (paddleY, side) => {
-      const b = state.ball
-      const reaching = side === 'left'
-        ? b.vx < 0 && b.x - BALL_R < PADDLE_W
-        : b.vx > 0 && b.x + BALL_R > W - PADDLE_W
-      if (!reaching || b.y < paddleY || b.y > paddleY + PADDLE_H) return
-      b.x  = side === 'left' ? PADDLE_W + BALL_R : W - PADDLE_W - BALL_R
-      b.vx = -b.vx * 1.05
-      b.vy = BALL_SPEED * ((b.y - (paddleY + PADDLE_H / 2)) / (PADDLE_H / 2))
+    let lastSentDir = { x: 0, y: 0 }
+    function commitTurn(dir) {
+      if (Math.abs(dir.x - lastSentDir.x) < 0.05 && Math.abs(dir.y - lastSentDir.y) < 0.05) return
+      lastSentDir = dir
+      const me  = players[room.selfId]
+      const now = Date.now()
+      me.pos          = positionAt(me, now)
+      me.lastTurnTime = now
+      me.dir          = dir
+      room.send('turn', { dir, pos: me.pos, t: now })
     }
 
-    let lastT = performance.now()
-    const step = now => {
-      const dt = Math.min(0.05, (now - lastT) / 1000)   // clamp to avoid tab-out teleport
-      lastT = now
+    // ════════════════════════════════════════════════════════════════════════
+    // PICKUP DETECTION (local intent → host arbitration)
+    // ════════════════════════════════════════════════════════════════════════
+    const lastIntentAt = Object.create(null)
+    function checkPickups(now) {
+      const me = players[room.selfId]
+      const myPos = positionAt(me, now)
+      const reach = PLAYER_R + COIN_R
+      for (const [coinId, coin] of Object.entries(coins)) {
+        if ((lastIntentAt[coinId] || 0) > now - INTENT_COOLDOWN) continue
+        if (torusDist2(myPos, coin) > reach * reach) continue
+        lastIntentAt[coinId] = now
+        room.send('grab', { coinId, t: now })
+      }
+    }
 
-      // My paddle: always local — instant input, no network round-trip.
-      if (myRole) {
-        let y = state.paddles[myRole]
-        if (input.touchY !== null) y = input.touchY - PADDLE_H / 2
-        else {
-          if (input.up)   y -= PADDLE_SPEED * dt
-          if (input.down) y += PADDLE_SPEED * dt
+    // ════════════════════════════════════════════════════════════════════════
+    // RENDER
+    // ════════════════════════════════════════════════════════════════════════
+    function renderScores() {
+      const sorted = Object.entries(players).sort((a, b) => (b[1].score | 0) - (a[1].score | 0))
+      scoresEl.innerHTML = sorted.map(([id, p]) => {
+        const cls = [id === room.selfId ? 'me' : '', id === room.hostId ? 'host' : ''].filter(Boolean).join(' ')
+        return `<span class="${cls}" style="color:${p.color};margin:0 0.6rem">${id.slice(0,4)}: ${p.score | 0}</span>`
+      }).join('')
+    }
+    renderScores()
+
+    function draw(now) {
+      ctx.fillStyle = '#111'; ctx.fillRect(0, 0, W, H)
+      for (const c of Object.values(coins)) {
+        ctx.fillStyle = '#ff0'
+        ctx.beginPath(); ctx.arc(c.x, c.y, COIN_R, 0, Math.PI * 2); ctx.fill()
+        ctx.strokeStyle = '#aa0'; ctx.lineWidth = 1; ctx.stroke()
+      }
+      for (const [id, p] of Object.entries(players)) {
+        const pos = positionAt(p, now)
+        ctx.fillStyle = p.color
+        ctx.beginPath(); ctx.arc(pos.x, pos.y, PLAYER_R, 0, Math.PI * 2); ctx.fill()
+        if (id === room.selfId) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke() }
+        if (id === room.hostId) {
+          ctx.fillStyle = '#fff'; ctx.font = 'bold 12px sans-serif'
+          ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'
+          ctx.fillText('♔', pos.x, pos.y - PLAYER_R - 2)
         }
-        state.paddles[myRole] = Math.max(0, Math.min(H - PADDLE_H, y))
       }
-
-      // Ball + scoring: host-only. Client just renders received snapshots.
-      if (myRole === 'host') {
-        const b = state.ball
-        b.x += b.vx * dt
-        b.y += b.vy * dt
-        if (b.y < BALL_R)     { b.y = BALL_R;     b.vy =  Math.abs(b.vy) }
-        if (b.y > H - BALL_R) { b.y = H - BALL_R; b.vy = -Math.abs(b.vy) }
-        bouncePaddle(state.paddles.host,   'left')
-        bouncePaddle(state.paddles.client, 'right')
-
-        if (b.x < -BALL_R)         { state.score.client++; sendScore(state.score); renderScore(); resetBall( 1) }
-        else if (b.x > W + BALL_R) { state.score.host++;   sendScore(state.score); renderScore(); resetBall(-1) }
-      }
-
-      draw()
-      requestAnimationFrame(step)
     }
 
-    // ── Render ───────────────────────────────────────────────────────────────
-    const draw = () => {
-      ctx.fillStyle = '#111';   ctx.fillRect(0, 0, W, H)
-      ctx.strokeStyle = '#333'; ctx.setLineDash([6, 8])
-      ctx.beginPath(); ctx.moveTo(W/2, 0); ctx.lineTo(W/2, H); ctx.stroke()
-      ctx.setLineDash([])
-      ctx.fillStyle = '#0f0';   ctx.fillRect(0,          state.paddles.host,   PADDLE_W, PADDLE_H)
-      ctx.fillStyle = '#0ff';   ctx.fillRect(W-PADDLE_W, state.paddles.client, PADDLE_W, PADDLE_H)
-      ctx.fillStyle = '#fff'
-      ctx.beginPath(); ctx.arc(state.ball.x, state.ball.y, BALL_R, 0, Math.PI * 2); ctx.fill()
+    function tick(now) {
+      // Touch direction is recomputed each frame: the touch point is fixed
+      // but the player moves toward it, so the angle changes continuously.
+      if (touchTarget) {
+        const me = players[room.selfId]
+        const p  = positionAt(me, now)
+        const dx = touchTarget.x - p.x, dy = touchTarget.y - p.y
+        const m  = Math.hypot(dx, dy)
+        if (m >= 8) commitTurn({ x: dx / m, y: dy / m })
+      }
+      checkPickups(now)
+      draw(now)
+      requestAnimationFrame(tick)
     }
-
-    requestAnimationFrame(step)
+    requestAnimationFrame(tick)
   </script>
 </body>
 </html>
